@@ -28,7 +28,7 @@ struct Analyzer {
                     continue
                 }
                 for req in info.requirements {
-                    if scene.providedTypes.contains(req.typeName) {
+                    if scene.provided.contains(req.kind) {
                         continue
                     }
                     out.append(

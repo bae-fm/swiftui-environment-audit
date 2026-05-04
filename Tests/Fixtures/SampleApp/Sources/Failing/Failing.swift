@@ -5,6 +5,21 @@ final class MyState {
     var counter = 0
 }
 
+struct AnalyticsClient {
+    let send: (String) -> Void
+}
+
+struct AnalyticsKey: EnvironmentKey {
+    static let defaultValue: AnalyticsClient = AnalyticsClient { _ in }
+}
+
+extension EnvironmentValues {
+    var analytics: AnalyticsClient {
+        get { self[AnalyticsKey.self] }
+        set { self[AnalyticsKey.self] = newValue }
+    }
+}
+
 struct FailingApp: App {
     @State private var state = MyState()
 
@@ -12,11 +27,13 @@ struct FailingApp: App {
         WindowGroup {
             ContentView()
                 .environment(state)
+                .environment(\.analytics, AnalyticsClient { _ in })
         }
         Settings {
-            // BUG: forgot `.environment(state)` — `Inner` will crash at
-            // render time because `MyState` is missing from the scene's
-            // environment.
+            // BUG 1: missing `.environment(state)` — `Inner` requires
+            // `MyState`.
+            // BUG 2: missing `.environment(\.analytics, …)` — `Inner`
+            // reads `\.analytics`, whose default is a no-op placeholder.
             SettingsRoot()
         }
     }
@@ -36,8 +53,12 @@ struct SettingsRoot: View {
 
 struct Inner: View {
     @Environment(MyState.self) private var state
+    @Environment(\.analytics) private var analytics
 
     var body: some View {
-        Text("counter: \(state.counter)")
+        Button("Tap") {
+            analytics.send("tapped")
+        }
+        .overlay(Text("counter: \(state.counter)"))
     }
 }

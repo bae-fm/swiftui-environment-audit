@@ -4,8 +4,11 @@
 #
 # Builds the SampleApp fixtures with `swift build -index-store-path`,
 # then asserts:
-#   - exit 1 on the Failing target with a finding for `MyState`
-#   - exit 0 on the Passing target with no findings.
+#   - Failing target: exit 1, with findings for the type-form requirement
+#     (MyState) and the keypath-form requirement (\.analytics) both
+#     pinned to the SettingsRoot → Inner chain.
+#   - Passing target: exit 0. Inner also requires \.uiTheme but that key
+#     carries the optional marker, so the audit ignores it.
 
 set -euo pipefail
 
@@ -21,7 +24,16 @@ cd "$repo_root/Tests/Fixtures/SampleApp"
 idx="$PWD/.build/idx"
 swift build -Xswiftc -index-store-path -Xswiftc "$idx" >/dev/null
 
-echo "=== Failing fixture (expect exit 1, finding for MyState) ==="
+assert_contains() {
+    local needle="$1"
+    local file="$2"
+    if ! grep -qF "$needle" "$file"; then
+        echo "FAIL: expected '$needle' in $file" >&2
+        exit 1
+    fi
+}
+
+echo "=== Failing fixture (expect exit 1, MyState + \\.analytics findings) ==="
 set +e
 "$binary" --index-store-path "$idx" Sources/Failing > /tmp/audit-failing.txt 2>&1
 failing_exit=$?
@@ -31,17 +43,12 @@ if [[ $failing_exit -ne 1 ]]; then
     echo "FAIL: expected exit 1, got $failing_exit" >&2
     exit 1
 fi
-if ! grep -q "is missing MyState" /tmp/audit-failing.txt; then
-    echo "FAIL: expected 'is missing MyState' in output" >&2
-    exit 1
-fi
-if ! grep -q "chain: SettingsRoot → Inner" /tmp/audit-failing.txt; then
-    echo "FAIL: expected 'chain: SettingsRoot → Inner' in output" >&2
-    exit 1
-fi
+assert_contains "is missing MyState" /tmp/audit-failing.txt
+assert_contains "is missing \.analytics" /tmp/audit-failing.txt
+assert_contains "chain: SettingsRoot → Inner" /tmp/audit-failing.txt
 
 echo
-echo "=== Passing fixture (expect exit 0) ==="
+echo "=== Passing fixture (expect exit 0; \\.uiTheme is opt-out) ==="
 set +e
 "$binary" --index-store-path "$idx" Sources/Passing > /tmp/audit-passing.txt 2>&1
 passing_exit=$?
@@ -51,10 +58,7 @@ if [[ $passing_exit -ne 0 ]]; then
     echo "FAIL: expected exit 0, got $passing_exit" >&2
     exit 1
 fi
-if ! grep -q "No missing-environment findings" /tmp/audit-passing.txt; then
-    echo "FAIL: expected 'No missing-environment findings' in output" >&2
-    exit 1
-fi
+assert_contains "No missing-environment findings" /tmp/audit-passing.txt
 
 echo
 echo "All fixtures passed."

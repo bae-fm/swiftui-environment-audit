@@ -10,9 +10,16 @@ struct SceneInfo {
     /// `.environment(arg)` modifiers with their rightmost identifier
     /// locations, so the resolver can ask the index what each arg's type is.
     let providedExpressions: [ResolvableExpression]
-    /// Set of types the resolver successfully extracted from
-    /// `providedExpressions`.
-    let providedTypes: Set<String>
+    /// Keypath names from `.environment(\.someKey, value)` modifiers, e.g.
+    /// `"someKey"` for `\.someKey`. Captured separately from
+    /// `providedExpressions` because the keypath form doesn't need type
+    /// resolution — the keypath name itself is the identifier.
+    let providedKeypaths: Set<String>
+    /// Union of everything this scene provides:
+    ///   - `.type(T)` for each `providedExpressions` entry the resolver
+    ///     successfully resolved to a type, plus
+    ///   - `.keypath(K)` for each `providedKeypaths` entry.
+    let provided: Set<EnvKind>
     /// The enclosing `App`-conforming type. Always populated —
     /// `SceneCollector` only emits scenes that live inside an `: App`
     /// declaration.

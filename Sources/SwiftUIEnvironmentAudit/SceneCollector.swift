@@ -141,13 +141,21 @@ private final class AppBodyVisitor: SyntaxVisitor {
         let providedTypes = scout.providedExpressions.compactMap {
             resolver.resolve(expression: $0, bindings: scout.localBindings)
         }
+        var provided: Set<EnvKind> = []
+        for typeName in providedTypes {
+            provided.insert(.type(typeName))
+        }
+        for keypath in scout.providedKeypaths {
+            provided.insert(.keypath(keypath))
+        }
         return SceneInfo(
             kind: kind,
             sourceFile: file,
             line: line,
             rootViews: Array(scout.rootViews),
             providedExpressions: scout.providedExpressions,
-            providedTypes: Set(providedTypes),
+            providedKeypaths: scout.providedKeypaths,
+            provided: provided,
             enclosingType: enclosingType,
             localBindings: scout.localBindings
         )
@@ -168,6 +176,7 @@ private final class SceneContentScout: SyntaxVisitor {
     let resolver: IndexResolver
     var rootViews: Set<String> = []
     var providedExpressions: [ResolvableExpression] = []
+    var providedKeypaths: Set<String> = []
     var localBindings: [String: String] = [:]
 
     init(
@@ -197,8 +206,12 @@ private final class SceneContentScout: SyntaxVisitor {
             member.declName.baseName.text == "environment",
             let firstArg = node.arguments.first
         {
-            // Skip the keypath form: `.environment(\.key, value)`.
-            if firstArg.expression.is(KeyPathExprSyntax.self) == false {
+            if let keypath = firstArg.expression.as(KeyPathExprSyntax.self) {
+                if let name = keypathName(keypath) {
+                    providedKeypaths.insert(name)
+                }
+            }
+            else {
                 providedExpressions.append(
                     expression(from: firstArg.expression)
                 )

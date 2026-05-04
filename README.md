@@ -3,17 +3,45 @@
 Static checker that finds SwiftUI Scene roots missing the
 `@Environment(SomeType.self)` injections their descendants require.
 
-A `Scene { … }` whose view tree contains a view declaring
-`@Environment(SomeType.self) var foo` will crash at render time if
-`SomeType` isn't anywhere in the scene's environment chain. There is no
-compile-time signal — the property wrapper traps when the value is
-accessed. Common previews that wrap inner content views also miss the
-crash because they don't render through the same hierarchy.
+Two failure modes:
+
+1. A `Scene { … }` whose view tree contains a view declaring
+   `@Environment(SomeType.self) var foo` will crash at render time if
+   `SomeType` isn't anywhere in the scene's environment chain. There is
+   no compile-time signal — the property wrapper traps on access.
+   Common previews that wrap inner content views also miss the crash
+   because they don't render through the same hierarchy.
+
+2. A view declaring `@Environment(\.someKey)` for a custom
+   `EnvironmentKey` doesn't crash if missing — the key's `defaultValue`
+   is used. But for custom application keys (analytics clients, API
+   stubs, persistence services) the default is almost always a
+   placeholder that's wrong in production. Silent no-ops are strictly
+   worse than a crash.
 
 This tool walks every `: App` in a source tree, traces each `Scene`'s
-view-instantiation graph, collects every `@Environment(SomeType.self)`
-and `@EnvironmentObject` reachable from a Scene root, and reports any
-type that isn't provided by a `.environment(...)` modifier on the chain.
+view-instantiation graph, and reports:
+
+- any `@Environment(SomeType.self)` / `@EnvironmentObject` requirement
+  reachable from a Scene root that the chain doesn't provide;
+- any `@Environment(\.someKey)` requirement, where `\.someKey` is
+  declared in the scanned source as a `var someKey` on
+  `extension EnvironmentValues`, that the chain doesn't provide.
+
+Framework keypaths (`\.colorScheme`, `\.dismiss`, `\.locale`, etc.) are
+ignored automatically — their declarations live outside the scanned
+source. Per-key opt-out via comment marker is supported for any
+custom key whose `defaultValue` really is the production value:
+
+```swift
+extension EnvironmentValues {
+    // swiftui-environment-audit: optional
+    var lineLimit: Int? {
+        get { self[LineLimitKey.self] }
+        set { self[LineLimitKey.self] = newValue }
+    }
+}
+```
 
 ## How it works
 
@@ -96,9 +124,10 @@ swift build -c release
 - Type extraction at the declaration site handles explicit annotations
   (`var foo: T`) and constructor-call initializers (`var foo = T(...)`).
   Other inferred forms are reported as unresolved.
-- `@Environment(\.someKey)` (the `EnvironmentKey`/keypath form) is
-  intentionally skipped — those have a `defaultValue` and don't crash
-  when missing.
+- Built-in SwiftUI keypaths (`\.colorScheme`, `\.dismiss`, `\.locale`,
+  etc.) are ignored — their declarations are outside the scanned
+  source. To audit a key, declare it on `extension EnvironmentValues`
+  in code the tool sees.
 
 ## License
 

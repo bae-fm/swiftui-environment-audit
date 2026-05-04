@@ -198,7 +198,7 @@ for scene in collector.scenes {
             print("    \(name): \(type)")
         }
     }
-    if scene.providedExpressions.isEmpty {
+    if scene.providedExpressions.isEmpty && scene.providedKeypaths.isEmpty {
         print("  provided: (none)")
     }
     else {
@@ -209,6 +209,9 @@ for scene in collector.scenes {
                 bindings: scene.localBindings
             ) ?? "<unresolved>"
             print("    \(expr.text) → \(resolved)")
+        }
+        for keypath in scene.providedKeypaths.sorted() {
+            print("    \\.\(keypath)")
         }
     }
     print("")
@@ -223,7 +226,7 @@ print("Findings (\(findings.count)):")
 for finding in findings {
     print("")
     print(
-        "  ✗ \(finding.scene.kind) at \(finding.scene.sourceFile):\(finding.scene.line) is missing \(finding.requirement.typeName)"
+        "  ✗ \(finding.scene.kind) at \(finding.scene.sourceFile):\(finding.scene.line) is missing \(finding.requirement.kind.description)"
     )
     print(
         "    required by \(finding.requirement.declaringView) (\(finding.requirement.sourceFile):\(finding.requirement.line))"

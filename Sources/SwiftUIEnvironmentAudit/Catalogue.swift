@@ -3,8 +3,13 @@ import SwiftParser
 import SwiftSyntax
 
 /// Walks every `.swift` file once and builds the symbol tables the analyzer
-/// needs: `views` (every `struct/class : View` with its env requirements),
-/// and `apps` (every `: App` declaration).
+/// needs:
+///   - `views` (every `struct/class : View` with its env requirements),
+///   - `apps` (every `: App` declaration),
+///   - `userKeypaths` (every `var name: ...` declared on
+///     `extension EnvironmentValues`, minus those carrying the
+///     `// swiftui-environment-audit: optional` marker — these are the
+///     custom env keypaths the audit treats as required).
 ///
 /// We deliberately do *not* maintain a property/type catalogue here — type
 /// resolution happens later via `IndexResolver`, which queries the
@@ -16,6 +21,19 @@ final class Catalogue {
     /// Raw constructor-call names observed inside each view's body. Resolved
     /// against `views.keys` later to populate `ViewInfo.children`.
     var rawChildCalls: [String: Set<String>] = [:]
+    /// Keypath names declared in any `extension EnvironmentValues` we
+    /// scanned. Populated during `ingest`; used during `linkChildren` to
+    /// decide which `@Environment(\.foo)` view declarations should be
+    /// promoted to keypath requirements.
+    var userKeypaths: Set<String> = []
+    /// Keypaths whose declaration carried `// swiftui-environment-audit:
+    /// optional`. Subtracted from `userKeypaths` before promotion.
+    var optionalKeypaths: Set<String> = []
+    /// Pending keypath references collected from `@Environment(\.foo)`
+    /// view declarations. Resolved against `userKeypaths` /
+    /// `optionalKeypaths` in `linkChildren` once every file has been
+    /// ingested (declaration order isn't guaranteed).
+    var rawKeypathRequirements: [String: [(keypath: String, line: Int, file: String)]] = [:]
 
     func ingest(file: URL) throws {
         let source = try String(contentsOf: file, encoding: .utf8)
@@ -32,8 +50,10 @@ final class Catalogue {
         visitor.walk(tree)
     }
 
-    /// Resolve raw constructor-call names against the known view set so each
-    /// `ViewInfo.children` only points at declarations we've actually seen.
+    /// Cross-file finalize step. Runs after every file has been ingested:
+    ///   - Resolves child constructor-call names against the known view set.
+    ///   - Promotes `rawKeypathRequirements` to real `EnvRequirement`s for
+    ///     keypaths the user actually declared and didn't opt out of.
     func linkChildren() {
         for (parent, calls) in rawChildCalls {
             guard var info = views[parent] else {
@@ -41,6 +61,23 @@ final class Catalogue {
             }
             info.children = calls.intersection(views.keys)
             views[parent] = info
+        }
+        let required = userKeypaths.subtracting(optionalKeypaths)
+        for (view, candidates) in rawKeypathRequirements {
+            guard var info = views[view] else {
+                continue
+            }
+            for candidate in candidates where required.contains(candidate.keypath) {
+                info.requirements.append(
+                    EnvRequirement(
+                        kind: .keypath(candidate.keypath),
+                        declaringView: view,
+                        sourceFile: candidate.file,
+                        line: candidate.line
+                    )
+                )
+            }
+            views[view] = info
         }
     }
 }
@@ -100,6 +137,34 @@ private final class TopLevelVisitor: SyntaxVisitor {
         typeStack.removeLast()
     }
 
+    /// `extension EnvironmentValues { var someKey: ... }` — record each
+    /// var binding's name as a user-declared keypath. Detect the
+    /// `// swiftui-environment-audit: optional` marker on the var decl.
+    override func visit(_ node: ExtensionDeclSyntax) -> SyntaxVisitorContinueKind {
+        guard node.extendedType.trimmedDescription == "EnvironmentValues" else {
+            return .visitChildren
+        }
+        for member in node.memberBlock.members {
+            guard let varDecl = member.decl.as(VariableDeclSyntax.self) else {
+                continue
+            }
+            let optional = hasOptionalMarker(in: varDecl.leadingTrivia)
+            for binding in varDecl.bindings {
+                guard let pattern = binding.pattern
+                    .as(IdentifierPatternSyntax.self)
+                else {
+                    continue
+                }
+                let name = pattern.identifier.text
+                catalogue.userKeypaths.insert(name)
+                if optional {
+                    catalogue.optionalKeypaths.insert(name)
+                }
+            }
+        }
+        return .visitChildren
+    }
+
     private func enterType(
         name: String,
         inheritance: InheritanceClauseSyntax?,
@@ -135,12 +200,10 @@ private final class TopLevelVisitor: SyntaxVisitor {
                 }
                 let attrName = attrSyntax.attributeName.trimmedDescription
                 if attrName == "Environment" {
-                    if let req = parseEnvironmentAttribute(
+                    handleEnvironmentAttribute(
                         attribute: attrSyntax,
-                        viewName: info.name
-                    ) {
-                        info.requirements.append(req)
-                    }
+                        info: &info
+                    )
                 }
                 else if attrName == "EnvironmentObject" {
                     if let req = parseEnvironmentObjectBinding(
@@ -154,33 +217,42 @@ private final class TopLevelVisitor: SyntaxVisitor {
         }
     }
 
-    private func parseEnvironmentAttribute(
+    /// `@Environment(SomeType.self)` → real type requirement, recorded now.
+    /// `@Environment(\.someKey)`     → candidate keypath requirement,
+    ///                                  promoted in `linkChildren` once the
+    ///                                  full keypath catalogue is built.
+    private func handleEnvironmentAttribute(
         attribute: AttributeSyntax,
-        viewName: String
-    ) -> EnvRequirement? {
+        info: inout ViewInfo
+    ) {
         guard let args = attribute.arguments?.as(LabeledExprListSyntax.self),
             let firstArg = args.first
         else {
-            return nil
+            return
         }
-        // `@Environment(SomeType.self)` — the @Observable form. Crashes if
-        // missing. The argument is a member-access expression with `.self`.
+        let line = converter.location(for: attribute.position).line
         if let memberAccess = firstArg.expression
             .as(MemberAccessExprSyntax.self),
             memberAccess.declName.baseName.text == "self",
             let base = memberAccess.base?.as(DeclReferenceExprSyntax.self)
         {
-            let line = converter.location(for: attribute.position).line
-            return EnvRequirement(
-                typeName: base.baseName.text,
-                declaringView: viewName,
-                sourceFile: file,
-                line: line
+            info.requirements.append(
+                EnvRequirement(
+                    kind: .type(base.baseName.text),
+                    declaringView: info.name,
+                    sourceFile: file,
+                    line: line
+                )
+            )
+            return
+        }
+        if let keypath = firstArg.expression.as(KeyPathExprSyntax.self),
+            let name = keypathName(keypath)
+        {
+            catalogue.rawKeypathRequirements[info.name, default: []].append(
+                (keypath: name, line: line, file: file)
             )
         }
-        // `@Environment(\.someKey)` — keypath form. Resolves to an
-        // `EnvironmentKey` with a `defaultValue`, so it does not crash.
-        return nil
     }
 
     private func parseEnvironmentObjectBinding(
@@ -195,7 +267,7 @@ private final class TopLevelVisitor: SyntaxVisitor {
         let typeName = typeAnnotation.type.trimmedDescription
         let line = converter.location(for: binding.position).line
         return EnvRequirement(
-            typeName: typeName,
+            kind: .type(typeName),
             declaringView: viewName,
             sourceFile: file,
             line: line
@@ -214,6 +286,35 @@ private final class TopLevelVisitor: SyntaxVisitor {
         calls.formUnion(scout.calls)
         catalogue.rawChildCalls[parent] = calls
     }
+
+    private func hasOptionalMarker(in trivia: Trivia) -> Bool {
+        for piece in trivia {
+            switch piece {
+            case .lineComment(let text), .blockComment(let text),
+                .docLineComment(let text), .docBlockComment(let text):
+                if text.contains("swiftui-environment-audit: optional") {
+                    return true
+                }
+            default:
+                continue
+            }
+        }
+        return false
+    }
+}
+
+/// Pull the property name off `\.someKey` or `\EnvironmentValues.someKey`.
+/// Returns nil for keypaths whose first non-base component isn't a plain
+/// identifier (subscripts, optional chains).
+func keypathName(_ keypath: KeyPathExprSyntax) -> String? {
+    for component in keypath.components {
+        if let property = component.component
+            .as(KeyPathPropertyComponentSyntax.self)
+        {
+            return property.declName.baseName.text
+        }
+    }
+    return nil
 }
 
 /// Collects every uppercase-named `IdentifierExpr(...)` call from a syntax
