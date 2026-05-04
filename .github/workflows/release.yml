@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & publish binary
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release binary
+        run: swift build -c release
+
+      - name: Run fixture suite
+        run: bash Tests/run-fixtures.sh
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          tar -C .build/release -czf "dist/swiftui-environment-audit-${GITHUB_REF_NAME}-macos-arm64.tar.gz" \
+            swiftui-environment-audit
+          (cd dist && shasum -a 256 *.tar.gz > SHA256SUMS)
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/swiftui-environment-audit-${GITHUB_REF_NAME}-macos-arm64.tar.gz \
+            dist/SHA256SUMS
