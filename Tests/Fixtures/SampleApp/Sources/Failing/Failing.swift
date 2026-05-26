@@ -62,3 +62,11 @@ struct Inner: View {
         .overlay(Text("counter: \(state.counter)"))
     }
 }
+
+// BUG 3: preview renders `Inner` without injecting `MyState` or
+// `\.analytics`. SwiftUI traps at render time the same way the missing
+// Settings injection does — and the App-scoped audit alone wouldn't
+// notice, because the preview is a separate root.
+#Preview("Failing Inner") {
+    Inner()
+}

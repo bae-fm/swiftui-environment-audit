@@ -1,16 +1,19 @@
 # swiftui-environment-audit
 
-Static checker that finds SwiftUI Scene roots missing the
+Static checker that finds SwiftUI root view trees missing the
 `@Environment(SomeType.self)` injections their descendants require.
 
 Two failure modes:
 
-1. A `Scene { … }` whose view tree contains a view declaring
-   `@Environment(SomeType.self) var foo` will crash at render time if
-   `SomeType` isn't anywhere in the scene's environment chain. There is
-   no compile-time signal — the property wrapper traps on access.
-   Common previews that wrap inner content views also miss the crash
-   because they don't render through the same hierarchy.
+1. A root view tree — a `Scene { … }` or a `#Preview { … }` —
+   whose descendants declare `@Environment(SomeType.self) var foo`
+   will crash at render time if `SomeType` isn't anywhere in that
+   tree's environment chain. There is no compile-time signal — the
+   property wrapper traps on access. Previews are especially prone
+   to this because their root is independent of the App's Scenes:
+   every dependency the rendered view reads has to be injected from
+   the preview body itself, and forgetting one only shows up the
+   next time someone opens the canvas.
 
 2. A view declaring `@Environment(\.someKey)` for a custom
    `EnvironmentKey` doesn't crash if missing — the key's `defaultValue`
@@ -19,11 +22,12 @@ Two failure modes:
    placeholder that's wrong in production. Silent no-ops are strictly
    worse than a crash.
 
-This tool walks every `: App` in a source tree, traces each `Scene`'s
-view-instantiation graph, and reports:
+This tool walks every `: App` in a source tree (each `Scene` inside
+its body) and every freestanding `#Preview { ... }` macro, traces
+each tree's view-instantiation graph, and reports:
 
 - any `@Environment(SomeType.self)` / `@EnvironmentObject` requirement
-  reachable from a Scene root that the chain doesn't provide;
+  reachable from a root that the chain doesn't provide;
 - any `@Environment(\.someKey)` requirement, where `\.someKey` is
   declared in the scanned source as a `var someKey` on
   `extension EnvironmentValues`, that the chain doesn't provide.
@@ -46,8 +50,9 @@ extension EnvironmentValues {
 ## How it works
 
 - **AST shape (SwiftSyntax)**: discovers `: View`/`: App` declarations,
-  `Scene { }` calls, `.environment(arg)` modifiers, and the local
-  `let`/`if let` bindings inside scene closures.
+  `Scene { }` calls, `#Preview { }` macro expansions,
+  `.environment(arg)` modifiers, and the local `let`/`if let` bindings
+  inside root content closures.
 - **Type resolution (IndexStoreDB)**: for each `.environment(arg)`, the
   source location of the arg's rightmost identifier is handed to the
   SourceKit index store the build produced. The compiler already
@@ -58,6 +63,11 @@ extension EnvironmentValues {
   bindings inside closures, so those are resolved separately by walking
   the closure's `if let X = expr` / `let X = expr` patterns and
   resolving each RHS through the same index lookup.
+- **Constructor calls**: `.environment(MyState())` is taken directly
+  off the AST — the index would record `MyState` as a type symbol,
+  not a property of that type. Previews routinely inline-construct
+  their dependencies because there's no enclosing instance to hold
+  them; this is the path that resolves those.
 
 What this buys versus pure name matching: cross-file/module resolution,
 no dependence on naming conventions, function-call argument types

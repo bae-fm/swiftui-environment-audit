@@ -43,6 +43,13 @@ final class IndexResolver {
         if isPlainIdentifier(trimmed), let bound = bindings[trimmed] {
             return bound
         }
+        // AST-side fast path for `T(...)` constructor calls — the
+        // index records `T` as a type symbol, not a property of type
+        // `T`, so `propertyType(forUSR:)` would return nil for the
+        // common preview shape `.environment(MyState())`.
+        if let ctor = expression.constructorType {
+            return ctor
+        }
         guard let location = expression.identifierLocation else {
             return nil
         }

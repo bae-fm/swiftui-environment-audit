@@ -2,17 +2,19 @@ import Foundation
 import SwiftParser
 import SwiftSyntax
 
-/// Walks every `: App` declaration found by `Catalogue` and extracts each
-/// `Scene { ... }` call inside its `body`. For each scene we record the
-/// root view type(s) it constructs, the `.environment(...)` modifiers
-/// chained on anything inside its content closure (with the source
-/// location of each argument's rightmost identifier), and the local
-/// `let`/`if let` bindings introduced inside the closure (with their
-/// resolved types).
+/// Walks every `: App` declaration found by `Catalogue` and extracts
+/// each `Scene { ... }` call inside its `body`. For each scene we
+/// record the root view type(s) it constructs, the `.environment(...)`
+/// modifiers chained on anything inside its content closure (with the
+/// source location of each argument's rightmost identifier), and the
+/// local `let`/`if let` bindings introduced inside the closure (with
+/// their resolved types). Results land in `roots` as `RootInfo` values
+/// with a `.scene(...)` origin, alongside any previews picked up by
+/// `PreviewCollector`.
 final class SceneCollector {
     private let catalogue: Catalogue
     private let resolver: IndexResolver
-    private(set) var scenes: [SceneInfo] = []
+    private(set) var roots: [RootInfo] = []
 
     init(catalogue: Catalogue, resolver: IndexResolver) {
         self.catalogue = catalogue
@@ -40,8 +42,8 @@ final class SceneCollector {
             converter: converter,
             catalogue: catalogue,
             resolver: resolver,
-            sink: { [weak self] scene in
-                self?.scenes.append(scene)
+            sink: { [weak self] root in
+                self?.roots.append(root)
             }
         )
         visitor.walk(tree)
@@ -53,7 +55,7 @@ private final class AppBodyVisitor: SyntaxVisitor {
     let converter: SourceLocationConverter
     let catalogue: Catalogue
     let resolver: IndexResolver
-    let sink: (SceneInfo) -> Void
+    let sink: (RootInfo) -> Void
     private var typeStack: [String] = []
 
     init(
@@ -61,7 +63,7 @@ private final class AppBodyVisitor: SyntaxVisitor {
         converter: SourceLocationConverter,
         catalogue: Catalogue,
         resolver: IndexResolver,
-        sink: @escaping (SceneInfo) -> Void
+        sink: @escaping (RootInfo) -> Void
     ) {
         self.file = file
         self.converter = converter
@@ -106,7 +108,7 @@ private final class AppBodyVisitor: SyntaxVisitor {
         if let info = makeScene(
             from: node,
             kind: callee.baseName.text,
-            enclosingType: enclosing
+            enclosingApp: enclosing
         ) {
             sink(info)
         }
@@ -116,194 +118,26 @@ private final class AppBodyVisitor: SyntaxVisitor {
     private func makeScene(
         from call: FunctionCallExprSyntax,
         kind: String,
-        enclosingType: String
-    ) -> SceneInfo? {
-        let closure: ClosureExprSyntax?
-        if let trailing = call.trailingClosure {
-            closure = trailing
-        }
-        else {
-            closure = call.arguments
-                .compactMap { $0.expression.as(ClosureExprSyntax.self) }
-                .last
-        }
-        guard let closure else {
+        enclosingApp: String
+    ) -> RootInfo? {
+        guard let closure = RootContentScout.bodyClosure(
+            trailingClosure: call.trailingClosure,
+            arguments: call.arguments
+        ) else {
             return nil
         }
         let line = converter.location(for: call.position).line
-        let scout = SceneContentScout(
+        let scout = RootContentScout(
             knownViews: Set(catalogue.views.keys),
             file: file,
             converter: converter,
             resolver: resolver
         )
         scout.walk(closure.statements)
-        let providedTypes = scout.providedExpressions.compactMap {
-            resolver.resolve(expression: $0, bindings: scout.localBindings)
-        }
-        var provided: Set<EnvKind> = []
-        for typeName in providedTypes {
-            provided.insert(.type(typeName))
-        }
-        for keypath in scout.providedKeypaths {
-            provided.insert(.keypath(keypath))
-        }
-        return SceneInfo(
+        return scout.collect(
             kind: kind,
-            sourceFile: file,
             line: line,
-            rootViews: Array(scout.rootViews),
-            providedExpressions: scout.providedExpressions,
-            providedKeypaths: scout.providedKeypaths,
-            provided: provided,
-            enclosingType: enclosingType,
-            localBindings: scout.localBindings
-        )
-    }
-}
-
-/// Walks a Scene's content closure and pulls out:
-///   - root-level view constructors,
-///   - every `.environment(arg)` call's argument expression with the
-///     source location of arg's rightmost identifier,
-///   - every `if let X = expr` / `guard let X = expr` / `let X = expr`
-///     binding with arg resolved to a type via the index, so later
-///     `.environment(X.foo)` resolution can use the local binding's type.
-private final class SceneContentScout: SyntaxVisitor {
-    let knownViews: Set<String>
-    let file: String
-    let converter: SourceLocationConverter
-    let resolver: IndexResolver
-    var rootViews: Set<String> = []
-    var providedExpressions: [ResolvableExpression] = []
-    var providedKeypaths: Set<String> = []
-    var localBindings: [String: String] = [:]
-
-    init(
-        knownViews: Set<String>,
-        file: String,
-        converter: SourceLocationConverter,
-        resolver: IndexResolver
-    ) {
-        self.knownViews = knownViews
-        self.file = file
-        self.converter = converter
-        self.resolver = resolver
-        super.init(viewMode: .sourceAccurate)
-    }
-
-    override func visit(
-        _ node: FunctionCallExprSyntax
-    ) -> SyntaxVisitorContinueKind {
-        if let callee = node.calledExpression
-            .as(DeclReferenceExprSyntax.self),
-            knownViews.contains(callee.baseName.text)
-        {
-            rootViews.insert(callee.baseName.text)
-        }
-        if let member = node.calledExpression
-            .as(MemberAccessExprSyntax.self),
-            member.declName.baseName.text == "environment",
-            let firstArg = node.arguments.first
-        {
-            if let keypath = firstArg.expression.as(KeyPathExprSyntax.self) {
-                if let name = keypathName(keypath) {
-                    providedKeypaths.insert(name)
-                }
-            }
-            else {
-                providedExpressions.append(
-                    expression(from: firstArg.expression)
-                )
-            }
-        }
-        return .visitChildren
-    }
-
-    override func visit(
-        _ node: OptionalBindingConditionSyntax
-    ) -> SyntaxVisitorContinueKind {
-        if let pattern = node.pattern.as(IdentifierPatternSyntax.self),
-            let initializer = node.initializer
-        {
-            recordBinding(
-                name: pattern.identifier.text,
-                rhs: initializer.value
-            )
-        }
-        return .visitChildren
-    }
-
-    override func visit(
-        _ node: PatternBindingSyntax
-    ) -> SyntaxVisitorContinueKind {
-        if let pattern = node.pattern.as(IdentifierPatternSyntax.self),
-            let initializer = node.initializer
-        {
-            recordBinding(
-                name: pattern.identifier.text,
-                rhs: initializer.value
-            )
-        }
-        return .visitChildren
-    }
-
-    private func recordBinding(name: String, rhs: ExprSyntax) {
-        let expr = expression(from: rhs)
-        if let type = resolver.resolve(
-            expression: expr,
-            bindings: localBindings
-        ) {
-            localBindings[name] = type
-        }
-    }
-
-    private func expression(from expr: ExprSyntax) -> ResolvableExpression {
-        ResolvableExpression(
-            text: expr.trimmedDescription,
-            identifierLocation: rightmostIdentifierLocation(of: expr)
-        )
-    }
-
-    /// The position of the trailing identifier in a property-access chain
-    /// (`uiState` in `appDelegate.uiState`, `libraryStore` in
-    /// `appDelegate.appService?.libraryStore`, `appService` in a bare
-    /// `appService`). Returns nil for forms whose result has no pinpointed
-    /// identifier — call expressions terminate in parens, subscripts in
-    /// brackets, etc.
-    private func rightmostIdentifierLocation(
-        of expr: ExprSyntax
-    ) -> SourceLocation? {
-        if let member = expr.as(MemberAccessExprSyntax.self) {
-            return location(of: member.declName.baseName)
-        }
-        if let ref = expr.as(DeclReferenceExprSyntax.self) {
-            return location(of: ref.baseName)
-        }
-        if let optional = expr.as(OptionalChainingExprSyntax.self) {
-            return rightmostIdentifierLocation(
-                of: ExprSyntax(optional.expression)
-            )
-        }
-        if let force = expr.as(ForceUnwrapExprSyntax.self) {
-            return rightmostIdentifierLocation(
-                of: ExprSyntax(force.expression)
-            )
-        }
-        if let call = expr.as(FunctionCallExprSyntax.self) {
-            return rightmostIdentifierLocation(
-                of: ExprSyntax(call.calledExpression)
-            )
-        }
-        return nil
-    }
-
-    private func location(of token: TokenSyntax) -> SourceLocation {
-        let loc = converter.location(for: token.positionAfterSkippingLeadingTrivia)
-        return SourceLocation(
-            file: file,
-            line: loc.line,
-            utf8Column: loc.column
+            origin: .scene(enclosingApp: enclosingApp)
         )
     }
 }

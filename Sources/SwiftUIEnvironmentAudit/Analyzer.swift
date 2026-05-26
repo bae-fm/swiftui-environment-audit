@@ -2,38 +2,39 @@ import Foundation
 
 /// One missing-environment finding to report.
 struct Finding {
-    let scene: SceneInfo
+    let root: RootInfo
     let requirement: EnvRequirement
-    /// The view chain from a scene root down to the view that declared the
-    /// requirement. Useful in the report so the developer can see which
-    /// descendant is at fault.
+    /// The view chain from a root down to the view that declared the
+    /// requirement. Useful in the report so the developer can see
+    /// which descendant is at fault.
     let path: [String]
 }
 
-/// Joins `Catalogue` and `SceneCollector` output to produce findings.
+/// Joins `Catalogue` and the collectors' output to produce findings.
 ///
-/// For every scene: walk every reachable view in the transitive composition
-/// graph, collect their `@Environment(...)` requirements, and flag any type
-/// that no resolvable `.environment(...)` argument provides.
+/// For every root (Scene or `#Preview`): walk every reachable view in
+/// the transitive composition graph, collect their `@Environment(...)`
+/// requirements, and flag any type that no resolvable
+/// `.environment(...)` argument provides.
 struct Analyzer {
     let catalogue: Catalogue
-    let scenes: [SceneInfo]
+    let roots: [RootInfo]
 
     func findings() -> [Finding] {
         var out: [Finding] = []
-        for scene in scenes {
-            let reachable = transitiveViews(from: scene.rootViews)
+        for root in roots {
+            let reachable = transitiveViews(from: root.rootViews)
             for view in reachable.keys.sorted() {
                 guard let info = catalogue.views[view] else {
                     continue
                 }
                 for req in info.requirements {
-                    if scene.provided.contains(req.kind) {
+                    if root.provided.contains(req.kind) {
                         continue
                     }
                     out.append(
                         Finding(
-                            scene: scene,
+                            root: root,
                             requirement: req,
                             path: reachable[view] ?? [view]
                         )
@@ -44,9 +45,9 @@ struct Analyzer {
         return out
     }
 
-    /// BFS from each root, returning a map from reachable view name → the
-    /// shortest path that reached it. The path lets the report show how the
-    /// requirement gets pulled in.
+    /// BFS from each root, returning a map from reachable view name →
+    /// the shortest path that reached it. The path lets the report
+    /// show how the requirement gets pulled in.
     private func transitiveViews(from roots: [String]) -> [String: [String]] {
         var visited: [String: [String]] = [:]
         var queue: [(String, [String])] = roots.map { ($0, [$0]) }

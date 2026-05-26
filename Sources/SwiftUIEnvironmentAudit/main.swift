@@ -13,9 +13,9 @@ import IndexStoreDB
 /// toolchain. Override only when running against a non-Xcode toolchain.
 ///
 /// The remaining positional arguments are directories or files to scan
-/// for views and Scene roots. The scan source set and the index don't have
-/// to overlap exactly, but env-requirement detection only sees views
-/// inside the scan set.
+/// for views, Scene roots, and `#Preview` macro roots. The scan source
+/// set and the index don't have to overlap exactly, but env-requirement
+/// detection only sees views inside the scan set.
 
 struct CLIOptions {
     var indexStorePath: String?
@@ -35,8 +35,8 @@ func usage() -> Never {
                                     (default: active Xcode toolchain)
 
         Positional arguments are directories or .swift files to scan for
-        views and Scene roots. Exit code is 1 if any missing-environment
-        finding is reported, 0 otherwise.
+        views, Scene roots, and #Preview macro roots. Exit code is 1 if
+        any missing-environment finding is reported, 0 otherwise.
 
         """
     FileHandle.standardError.write(Data(msg.utf8))
@@ -167,10 +167,12 @@ for file in swiftFiles {
 catalogue.linkChildren()
 
 let resolver = IndexResolver(index: index)
-let collector = SceneCollector(catalogue: catalogue, resolver: resolver)
+let sceneCollector = SceneCollector(catalogue: catalogue, resolver: resolver)
+let previewCollector = PreviewCollector(catalogue: catalogue, resolver: resolver)
 for file in swiftFiles {
     do {
-        try collector.ingest(file: file)
+        try sceneCollector.ingest(file: file)
+        try previewCollector.ingest(file: file)
     }
     catch {
         FileHandle.standardError.write(
@@ -179,38 +181,68 @@ for file in swiftFiles {
     }
 }
 
-let analyzer = Analyzer(catalogue: catalogue, scenes: collector.scenes)
+let roots = sceneCollector.roots + previewCollector.roots
+let analyzer = Analyzer(catalogue: catalogue, roots: roots)
 let findings = analyzer.findings()
 
 print("Scanned \(swiftFiles.count) Swift files.")
 print(
-    "Catalogued \(catalogue.views.count) views, \(catalogue.apps.count) App declarations, \(collector.scenes.count) scenes."
+    "Catalogued \(catalogue.views.count) views, \(catalogue.apps.count) App declarations, \(sceneCollector.roots.count) scenes, \(previewCollector.roots.count) previews."
 )
 print("")
 
-for scene in collector.scenes {
-    print("scene: \(scene.kind) at \(scene.sourceFile):\(scene.line)")
-    print("  enclosing App: \(scene.enclosingType)")
-    print("  roots: \(scene.rootViews.sorted().joined(separator: ", "))")
-    if !scene.localBindings.isEmpty {
+/// Heading line for a root: discriminates scene vs preview and adds
+/// the preview label when present.
+func heading(for root: RootInfo) -> String {
+    switch root.origin {
+    case .scene:
+        return "scene: \(root.kind) at \(root.sourceFile):\(root.line)"
+    case .preview(let label):
+        let labelPart = label.map { " '\($0)'" } ?? ""
+        return "preview:\(labelPart) at \(root.sourceFile):\(root.line)"
+    }
+}
+
+/// Identifier used in finding output. The per-root listing uses
+/// `heading(for:)`; findings refer back to the same root with this
+/// shorter form so reports stay grep-able.
+func findingHeading(for root: RootInfo) -> String {
+    switch root.origin {
+    case .scene:
+        return root.kind
+    case .preview(let label):
+        return label.map { "Preview '\($0)'" } ?? "Preview"
+    }
+}
+
+for root in roots {
+    print(heading(for: root))
+    switch root.origin {
+    case .scene(let enclosingApp):
+        print("  enclosing App: \(enclosingApp)")
+    case .preview:
+        break
+    }
+    print("  roots: \(root.rootViews.sorted().joined(separator: ", "))")
+    if !root.localBindings.isEmpty {
         print("  local bindings:")
-        for (name, type) in scene.localBindings.sorted(by: { $0.key < $1.key }) {
+        for (name, type) in root.localBindings.sorted(by: { $0.key < $1.key }) {
             print("    \(name): \(type)")
         }
     }
-    if scene.providedExpressions.isEmpty && scene.providedKeypaths.isEmpty {
+    if root.providedExpressions.isEmpty && root.providedKeypaths.isEmpty {
         print("  provided: (none)")
     }
     else {
         print("  provided expressions:")
-        for expr in scene.providedExpressions {
+        for expr in root.providedExpressions {
             let resolved = resolver.resolve(
                 expression: expr,
-                bindings: scene.localBindings
+                bindings: root.localBindings
             ) ?? "<unresolved>"
             print("    \(expr.text) → \(resolved)")
         }
-        for keypath in scene.providedKeypaths.sorted() {
+        for keypath in root.providedKeypaths.sorted() {
             print("    \\.\(keypath)")
         }
     }
@@ -226,7 +258,7 @@ print("Findings (\(findings.count)):")
 for finding in findings {
     print("")
     print(
-        "  ✗ \(finding.scene.kind) at \(finding.scene.sourceFile):\(finding.scene.line) is missing \(finding.requirement.kind.description)"
+        "  ✗ \(findingHeading(for: finding.root)) at \(finding.root.sourceFile):\(finding.root.line) is missing \(finding.requirement.kind.description)"
     )
     print(
         "    required by \(finding.requirement.declaringView) (\(finding.requirement.sourceFile):\(finding.requirement.line))"

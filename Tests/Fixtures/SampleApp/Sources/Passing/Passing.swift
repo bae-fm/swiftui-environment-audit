@@ -73,3 +73,12 @@ struct Inner: View {
         .overlay(Text("counter: \(state.counter)"))
     }
 }
+
+// Preview parallels the Settings scene above: injects every required
+// environment value, omits the `\.uiTheme` opt-out key. Audit should
+// report no finding for this tree.
+#Preview("Passing Inner") {
+    Inner()
+        .environment(MyState())
+        .environment(\.analytics, AnalyticsClient { _ in })
+}

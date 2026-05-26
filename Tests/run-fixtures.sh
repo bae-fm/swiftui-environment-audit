@@ -6,9 +6,12 @@
 # then asserts:
 #   - Failing target: exit 1, with findings for the type-form requirement
 #     (MyState) and the keypath-form requirement (\.analytics) both
-#     pinned to the SettingsRoot → Inner chain.
+#     pinned to the SettingsRoot → Inner chain, plus a preview-rooted
+#     finding chained directly to Inner.
 #   - Passing target: exit 0. Inner also requires \.uiTheme but that key
-#     carries the optional marker, so the audit ignores it.
+#     carries the optional marker, so the audit ignores it. Includes a
+#     preview that injects every required value — must not raise
+#     findings.
 
 set -euo pipefail
 
@@ -46,6 +49,8 @@ fi
 assert_contains "is missing MyState" /tmp/audit-failing.txt
 assert_contains "is missing \.analytics" /tmp/audit-failing.txt
 assert_contains "chain: SettingsRoot → Inner" /tmp/audit-failing.txt
+assert_contains "Preview 'Failing Inner'" /tmp/audit-failing.txt
+assert_contains "chain: Inner" /tmp/audit-failing.txt
 
 echo
 echo "=== Passing fixture (expect exit 0; \\.uiTheme is opt-out) ==="
