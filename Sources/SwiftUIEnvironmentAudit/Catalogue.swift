@@ -34,6 +34,15 @@ final class Catalogue {
     /// `optionalKeypaths` in `linkChildren` once every file has been
     /// ingested (declaration order isn't guaranteed).
     var rawKeypathRequirements: [String: [(keypath: String, line: Int, file: String)]] = [:]
+    /// Custom `extension View` modifier methods that apply environment
+    /// values, keyed by method name. Populated during `ingest`; expanded
+    /// transitively (and frozen into `viewModifiers`) by `linkModifiers`,
+    /// which `main.swift` calls after `linkChildren`.
+    var rawViewModifiers: [String: RawViewModifier] = [:]
+    /// Resolved view-modifier provisions after transitive expansion.
+    /// `RootContentScout` consults this when it sees a known modifier
+    /// applied (`.fooPreviewEnv()`).
+    var viewModifiers: [String: ResolvedViewModifier] = [:]
 
     func ingest(file: URL) throws {
         let source = try String(contentsOf: file, encoding: .utf8)
@@ -78,6 +87,34 @@ final class Catalogue {
                 )
             }
             views[view] = info
+        }
+    }
+
+    /// Cross-file finalize for custom `extension View` env modifiers. Runs
+    /// after every file has been ingested. Expands each modifier's
+    /// provisions transitively over the other modifiers it calls (a
+    /// modifier that calls another inherits its provisions), guarding
+    /// against cycles, and freezes the result into `viewModifiers`.
+    func linkModifiers() {
+        for name in rawViewModifiers.keys {
+            var exprs: [ResolvableExpression] = []
+            var keypaths: Set<String> = []
+            var seen: Set<String> = []
+            var stack = [name]
+            while let current = stack.popLast() {
+                guard seen.insert(current).inserted,
+                    let raw = rawViewModifiers[current]
+                else {
+                    continue
+                }
+                exprs.append(contentsOf: raw.exprs)
+                keypaths.formUnion(raw.keypaths)
+                stack.append(contentsOf: raw.calledModifiers)
+            }
+            viewModifiers[name] = ResolvedViewModifier(
+                exprs: exprs,
+                keypaths: keypaths
+            )
         }
     }
 }
@@ -137,11 +174,18 @@ private final class TopLevelVisitor: SyntaxVisitor {
         typeStack.removeLast()
     }
 
-    /// `extension EnvironmentValues { var someKey: ... }` — record each
-    /// var binding's name as a user-declared keypath. Detect the
-    /// `// swiftui-environment-audit: optional` marker on the var decl.
+    /// `extension View { func fooEnv() -> some View { … } }` — record each
+    /// method that applies environment values, so applying the modifier
+    /// later (`.fooEnv()`) counts as providing them. `extension
+    /// EnvironmentValues { var someKey: ... }` — record keypaths. Anything
+    /// else just keeps walking.
     override func visit(_ node: ExtensionDeclSyntax) -> SyntaxVisitorContinueKind {
-        guard node.extendedType.trimmedDescription == "EnvironmentValues" else {
+        let extendedType = node.extendedType.trimmedDescription
+        if extendedType == "View" {
+            collectViewModifiers(in: node.memberBlock.members)
+            return .visitChildren
+        }
+        guard extendedType == "EnvironmentValues" else {
             return .visitChildren
         }
         for member in node.memberBlock.members {
@@ -287,6 +331,45 @@ private final class TopLevelVisitor: SyntaxVisitor {
         catalogue.rawChildCalls[parent] = calls
     }
 
+    /// Scout each `func` member of an `extension View` for the env
+    /// values it applies to `self`, recording the result under the
+    /// method's name. A modifier that provides nothing (and calls no other
+    /// modifier) is skipped — applying it is a no-op for the audit.
+    private func collectViewModifiers(in members: MemberBlockItemListSyntax) {
+        for member in members {
+            guard let funcDecl = member.decl.as(FunctionDeclSyntax.self),
+                let body = funcDecl.body
+            else {
+                continue
+            }
+            // Scout the body only — a `.environment(...)` in a default-arg
+            // or property-wrapper expression in the signature isn't a
+            // provision this modifier makes.
+            let scout = ModifierBodyScout(file: file, converter: converter)
+            scout.walk(body)
+            let raw = scout.modifier
+            if raw.exprs.isEmpty && raw.keypaths.isEmpty
+                && raw.calledModifiers.isEmpty
+            {
+                continue
+            }
+            // Modifiers are keyed by bare method name across the whole
+            // codebase, and a name can recur (same-named helpers in
+            // different files, or overloads on different `self`
+            // constraints). Union rather than overwrite so an earlier
+            // modifier's provisions aren't dropped by a later ingest —
+            // over-crediting a same-named overload is the conservative
+            // direction (fewer false positives), and matches how
+            // `rawChildCalls` accumulates across files.
+            var existing = catalogue.rawViewModifiers[funcDecl.name.text]
+                ?? RawViewModifier()
+            existing.exprs.append(contentsOf: raw.exprs)
+            existing.keypaths.formUnion(raw.keypaths)
+            existing.calledModifiers.formUnion(raw.calledModifiers)
+            catalogue.rawViewModifiers[funcDecl.name.text] = existing
+        }
+    }
+
     private func hasOptionalMarker(in trivia: Trivia) -> Bool {
         for piece in trivia {
             switch piece {
@@ -317,8 +400,67 @@ func keypathName(_ keypath: KeyPathExprSyntax) -> String? {
     return nil
 }
 
+/// Scouts a custom `extension View` modifier's body for the environment
+/// values it applies — `.environment(arg)`, `.environmentObject(arg)`,
+/// `.environment(\.key, …)` — plus the names of other modifier methods it
+/// calls (so `linkModifiers` can expand transitively). Reuses
+/// `ExpressionBuilder` so a captured expression resolves exactly like an
+/// inline `.environment(...)` argument in a Scene/preview body.
+private final class ModifierBodyScout: SyntaxVisitor {
+    let file: String
+    let converter: SourceLocationConverter
+    var modifier = RawViewModifier()
+
+    init(file: String, converter: SourceLocationConverter) {
+        self.file = file
+        self.converter = converter
+        super.init(viewMode: .sourceAccurate)
+    }
+
+    override func visit(
+        _ node: FunctionCallExprSyntax
+    ) -> SyntaxVisitorContinueKind {
+        guard let member = node.calledExpression
+            .as(MemberAccessExprSyntax.self)
+        else {
+            return .visitChildren
+        }
+        let memberName = member.declName.baseName.text
+        if memberName == "environment" || memberName == "environmentObject" {
+            if let firstArg = node.arguments.first {
+                if let keypath = firstArg.expression.as(KeyPathExprSyntax.self) {
+                    if let name = keypathName(keypath) {
+                        modifier.keypaths.insert(name)
+                    }
+                }
+                else {
+                    modifier.exprs.append(
+                        ExpressionBuilder.expression(
+                            from: firstArg.expression,
+                            file: file,
+                            converter: converter
+                        )
+                    )
+                }
+            }
+        }
+        else {
+            // A call to some other modifier method, e.g. another custom
+            // env bundle this one wraps. Record the name; `linkModifiers`
+            // only follows names that turn out to be modifiers, so calls to
+            // unrelated methods are harmless.
+            modifier.calledModifiers.insert(memberName)
+        }
+        return .visitChildren
+    }
+}
+
 /// Collects every uppercase-named `IdentifierExpr(...)` call from a syntax
-/// subtree. Names are resolved against the known view set later.
+/// subtree. Names are resolved against the known view set later. A
+/// generic-specialized call `Box<Inner>(…)` contributes both the wrapper
+/// (`Box`) and each uppercase generic-argument type (`Inner`) — the wrapped
+/// content is instantiated too, so its env requirements must be reachable
+/// from the parent.
 private final class ConstructorCallScout: SyntaxVisitor {
     var calls: Set<String> = []
 
@@ -329,14 +471,7 @@ private final class ConstructorCallScout: SyntaxVisitor {
     override func visit(
         _ node: FunctionCallExprSyntax
     ) -> SyntaxVisitorContinueKind {
-        if let callee = node.calledExpression
-            .as(DeclReferenceExprSyntax.self)
-        {
-            let name = callee.baseName.text
-            if name.first?.isUppercase == true {
-                calls.insert(name)
-            }
-        }
+        calls.formUnion(genericViewNames(fromCallee: node.calledExpression))
         return .visitChildren
     }
 }

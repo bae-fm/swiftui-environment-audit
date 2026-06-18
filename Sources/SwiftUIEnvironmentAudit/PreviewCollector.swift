@@ -111,7 +111,8 @@ private final class PreviewMacroVisitor: SyntaxVisitor {
             knownViews: Set(catalogue.views.keys),
             file: file,
             converter: converter,
-            resolver: resolver
+            resolver: resolver,
+            viewModifiers: catalogue.viewModifiers
         )
         scout.walk(closure.statements)
         let info = scout.collect(

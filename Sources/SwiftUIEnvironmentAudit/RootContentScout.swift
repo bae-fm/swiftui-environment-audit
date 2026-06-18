@@ -15,6 +15,11 @@ final class RootContentScout: SyntaxVisitor {
     let file: String
     let converter: SourceLocationConverter
     let resolver: IndexResolver
+    /// Resolved custom `extension View` modifiers (`func fooEnv() -> some
+    /// View { self.environment(...) }`). When the walk sees a known
+    /// modifier applied (`.fooEnv()`), it folds that modifier's captured
+    /// provisions into this root's, so the env it injects counts.
+    let viewModifiers: [String: ResolvedViewModifier]
     var rootViews: Set<String> = []
     var providedExpressions: [ResolvableExpression] = []
     var providedKeypaths: Set<String> = []
@@ -24,12 +29,14 @@ final class RootContentScout: SyntaxVisitor {
         knownViews: Set<String>,
         file: String,
         converter: SourceLocationConverter,
-        resolver: IndexResolver
+        resolver: IndexResolver,
+        viewModifiers: [String: ResolvedViewModifier] = [:]
     ) {
         self.knownViews = knownViews
         self.file = file
         self.converter = converter
         self.resolver = resolver
+        self.viewModifiers = viewModifiers
         super.init(viewMode: .sourceAccurate)
     }
 
@@ -86,26 +93,39 @@ final class RootContentScout: SyntaxVisitor {
     override func visit(
         _ node: FunctionCallExprSyntax
     ) -> SyntaxVisitorContinueKind {
-        if let callee = node.calledExpression
-            .as(DeclReferenceExprSyntax.self),
-            knownViews.contains(callee.baseName.text)
-        {
-            rootViews.insert(callee.baseName.text)
+        for name in viewNames(fromCallee: node.calledExpression)
+        where knownViews.contains(name) {
+            rootViews.insert(name)
         }
         if let member = node.calledExpression
-            .as(MemberAccessExprSyntax.self),
-            member.declName.baseName.text == "environment",
-            let firstArg = node.arguments.first
+            .as(MemberAccessExprSyntax.self)
         {
-            if let keypath = firstArg.expression.as(KeyPathExprSyntax.self) {
-                if let name = keypathName(keypath) {
-                    providedKeypaths.insert(name)
+            let memberName = member.declName.baseName.text
+            // `.environment(arg)` / `.environmentObject(arg)` — a literal
+            // provision attached somewhere in this body.
+            if memberName == "environment" || memberName == "environmentObject",
+                let firstArg = node.arguments.first
+            {
+                if let keypath = firstArg.expression.as(KeyPathExprSyntax.self) {
+                    if let name = keypathName(keypath) {
+                        providedKeypaths.insert(name)
+                    }
+                }
+                else {
+                    providedExpressions.append(
+                        ExpressionBuilder.expression(
+                            from: firstArg.expression,
+                            file: file,
+                            converter: converter
+                        )
+                    )
                 }
             }
-            else {
-                providedExpressions.append(
-                    expression(from: firstArg.expression)
-                )
+            // `.fooPreviewEnv()` — a custom `extension View` modifier whose
+            // body applies env. Fold in its captured provisions.
+            else if let modifier = viewModifiers[memberName] {
+                providedExpressions.append(contentsOf: modifier.exprs)
+                providedKeypaths.formUnion(modifier.keypaths)
             }
         }
         return .visitChildren
@@ -119,6 +139,7 @@ final class RootContentScout: SyntaxVisitor {
         {
             recordBinding(
                 name: pattern.identifier.text,
+                annotation: node.typeAnnotation,
                 rhs: initializer.value
             )
         }
@@ -133,14 +154,34 @@ final class RootContentScout: SyntaxVisitor {
         {
             recordBinding(
                 name: pattern.identifier.text,
+                annotation: node.typeAnnotation,
                 rhs: initializer.value
             )
         }
         return .visitChildren
     }
 
-    private func recordBinding(name: String, rhs: ExprSyntax) {
-        let expr = expression(from: rhs)
+    /// Record `let x = …` / `let x: T = …` so a later `.environment(x)`
+    /// resolves. When the binding carries an explicit `typeAnnotation`,
+    /// trust it directly and skip resolving the RHS — that handles forms
+    /// the index/AST can't see through, e.g. an immediately-invoked
+    /// closure `let store: ImportStore = { … }()`.
+    private func recordBinding(
+        name: String,
+        annotation: TypeAnnotationSyntax?,
+        rhs: ExprSyntax
+    ) {
+        if let annotation {
+            localBindings[name] = IndexResolver.stripOptional(
+                annotation.type.trimmedDescription
+            )
+            return
+        }
+        let expr = ExpressionBuilder.expression(
+            from: rhs,
+            file: file,
+            converter: converter
+        )
         if let type = resolver.resolve(
             expression: expr,
             bindings: localBindings
@@ -149,69 +190,47 @@ final class RootContentScout: SyntaxVisitor {
         }
     }
 
-    private func expression(from expr: ExprSyntax) -> ResolvableExpression {
-        ResolvableExpression(
-            text: expr.trimmedDescription,
-            identifierLocation: rightmostIdentifierLocation(of: expr),
-            constructorType: constructorType(of: expr)
-        )
+    /// The view type name(s) a call's callee names, for root detection.
+    /// A plain `Inner(...)` yields `["Inner"]`. A generic-specialized
+    /// `Box<Inner>(...)` callee is a `GenericSpecializationExprSyntax`, so
+    /// it yields the base view (`Box`) plus every generic argument that is
+    /// an uppercase identifier type (`Inner`) — the wrapped content is a
+    /// root whose env requirements must be satisfied too.
+    private func viewNames(fromCallee callee: ExprSyntax) -> [String] {
+        genericViewNames(fromCallee: callee)
     }
+}
 
-    /// `MyState()` → `"MyState"`. Returns nil for any other shape (a
-    /// property reference, a member-access chain, a non-constructor
-    /// call). Uppercase-leading callee is the Swift convention for
-    /// type constructors and matches the audit's view-discovery
-    /// heuristic in `Catalogue.ConstructorCallScout`.
-    private func constructorType(of expr: ExprSyntax) -> String? {
-        guard let call = expr.as(FunctionCallExprSyntax.self),
-            let callee = call.calledExpression
-                .as(DeclReferenceExprSyntax.self),
-            callee.baseName.text.first?.isUppercase == true
+/// `Box<Inner>(…)`'s callee is a `GenericSpecializationExprSyntax`; a plain
+/// `Inner(…)`'s callee is a `DeclReferenceExprSyntax`. Both the
+/// root-content walk and `Catalogue.ConstructorCallScout` need the same
+/// extraction — base view name (uppercase-leading) plus each uppercase
+/// generic-argument type — so it lives as a free function shared by both.
+func genericViewNames(fromCallee callee: ExprSyntax) -> [String] {
+    if let ref = callee.as(DeclReferenceExprSyntax.self) {
+        let name = ref.baseName.text
+        return name.first?.isUppercase == true ? [name] : []
+    }
+    guard let specialized = callee.as(GenericSpecializationExprSyntax.self)
+    else {
+        return []
+    }
+    var names: [String] = []
+    if let base = specialized.expression.as(DeclReferenceExprSyntax.self),
+        base.baseName.text.first?.isUppercase == true
+    {
+        names.append(base.baseName.text)
+    }
+    for argument in specialized.genericArgumentClause.arguments {
+        guard let identifierType = argument.argument
+            .as(IdentifierTypeSyntax.self)
         else {
-            return nil
+            continue
         }
-        return callee.baseName.text
+        let name = identifierType.name.text
+        if name.first?.isUppercase == true {
+            names.append(name)
+        }
     }
-
-    /// The position of the trailing identifier in a property-access
-    /// chain (`uiState` in `appDelegate.uiState`, `libraryStore` in
-    /// `appDelegate.appService?.libraryStore`, `appService` in a bare
-    /// `appService`). Returns nil for forms whose result has no
-    /// pinpointed identifier — call expressions terminate in parens,
-    /// subscripts in brackets, etc.
-    private func rightmostIdentifierLocation(
-        of expr: ExprSyntax
-    ) -> SourceLocation? {
-        if let member = expr.as(MemberAccessExprSyntax.self) {
-            return location(of: member.declName.baseName)
-        }
-        if let ref = expr.as(DeclReferenceExprSyntax.self) {
-            return location(of: ref.baseName)
-        }
-        if let optional = expr.as(OptionalChainingExprSyntax.self) {
-            return rightmostIdentifierLocation(
-                of: ExprSyntax(optional.expression)
-            )
-        }
-        if let force = expr.as(ForceUnwrapExprSyntax.self) {
-            return rightmostIdentifierLocation(
-                of: ExprSyntax(force.expression)
-            )
-        }
-        if let call = expr.as(FunctionCallExprSyntax.self) {
-            return rightmostIdentifierLocation(
-                of: ExprSyntax(call.calledExpression)
-            )
-        }
-        return nil
-    }
-
-    private func location(of token: TokenSyntax) -> SourceLocation {
-        let loc = converter.location(for: token.positionAfterSkippingLeadingTrivia)
-        return SourceLocation(
-            file: file,
-            line: loc.line,
-            utf8Column: loc.column
-        )
-    }
+    return names
 }

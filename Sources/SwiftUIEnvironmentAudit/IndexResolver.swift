@@ -142,16 +142,37 @@ final class IndexResolver {
         return (first.isLetter || first == "_")
             && s.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" }
     }
+
+    /// `AppService?` → `AppService`, `Foo!` → `Foo`. The optional wrapper
+    /// is irrelevant to whether the env requirement is satisfied — what
+    /// matters is the underlying type SwiftUI sees in the environment.
+    /// Also strips a `some `/`any ` prefix so an opaque/existential return
+    /// (`some View`, `any Service`) names its underlying type.
+    static func stripOptional(_ type: String) -> String {
+        var t = type
+        for prefix in ["some ", "any "] where t.hasPrefix(prefix) {
+            t.removeFirst(prefix.count)
+        }
+        while t.last == "?" || t.last == "!" {
+            t.removeLast()
+        }
+        return t
+    }
 }
 
-/// Locates the variable declaration whose binding's identifier sits at a
-/// given line/column, then extracts the bound type. Handles two cases the
+/// Locates the declaration whose name identifier sits at a given
+/// line/column, then extracts the type it denotes. Handles the cases the
 /// codebase actually uses:
 ///   - explicit `var foo: SomeType` annotations,
-///   - inferred `var foo = SomeType(...)` initializers (constructor-call).
-/// Other inferred forms (`var foo = compute()`) are out of scope here —
-/// callers see nil and bias toward over-reporting rather than wrong
-/// answers.
+///   - inferred `var foo = SomeType(...)` constructor-call initializers,
+///   - inferred `var foo = compute()` where `compute`'s declaration site is
+///     itself the resolution target (the index lands on the function), and
+///   - the function declaration itself (`func makeStore() -> SomeStore`),
+///     whose declared return type is the resolved type — this is what makes
+///     `.environment(makeStore())` and `.environment(PreviewData.x())`
+///     resolve.
+/// Other inferred forms are out of scope here — callers see nil and bias
+/// toward over-reporting rather than wrong answers.
 private final class VariableDeclFinder: SyntaxVisitor {
     let line: Int
     let utf8Column: Int
@@ -177,7 +198,9 @@ private final class VariableDeclFinder: SyntaxVisitor {
             return .visitChildren
         }
         if let annotation = node.typeAnnotation {
-            foundType = stripOptional(annotation.type.trimmedDescription)
+            foundType = IndexResolver.stripOptional(
+                annotation.type.trimmedDescription
+            )
             return .skipChildren
         }
         if let initializer = node.initializer,
@@ -191,14 +214,22 @@ private final class VariableDeclFinder: SyntaxVisitor {
         return .skipChildren
     }
 
-    /// `AppService?` → `AppService`, `Foo!` → `Foo`. The optional wrapper
-    /// is irrelevant to whether the env requirement is satisfied — what
-    /// matters is the underlying type SwiftUI sees in the environment.
-    private func stripOptional(_ type: String) -> String {
-        var t = type
-        while t.last == "?" || t.last == "!" {
-            t.removeLast()
+    /// `func makeStore() -> SomeStore` — when the index landed on the
+    /// function (a call like `.environment(makeStore())` resolves the
+    /// callee to its declaration), the function's return type is the value
+    /// type the env receives.
+    override func visit(
+        _ node: FunctionDeclSyntax
+    ) -> SyntaxVisitorContinueKind {
+        let loc = converter.location(for: node.name.position)
+        if loc.line != line || loc.column != utf8Column {
+            return .visitChildren
         }
-        return t
+        if let returnClause = node.signature.returnClause {
+            foundType = IndexResolver.stripOptional(
+                returnClause.type.trimmedDescription
+            )
+        }
+        return .skipChildren
     }
 }

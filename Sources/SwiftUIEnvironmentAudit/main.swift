@@ -165,6 +165,7 @@ for file in swiftFiles {
     }
 }
 catalogue.linkChildren()
+catalogue.linkModifiers()
 
 let resolver = IndexResolver(index: index)
 let sceneCollector = SceneCollector(catalogue: catalogue, resolver: resolver)
